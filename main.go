@@ -68,7 +68,9 @@ func fetchCount(keyword string) (int, error) {
 	}
 
 	body, err := io.ReadAll(resp.Body)
+
 	log.Printf("  Status: %d | Body preview: %.300s", resp.StatusCode, string(body))
+
 	if err != nil {
 		return 0, fmt.Errorf("read body: %w", err)
 	}
