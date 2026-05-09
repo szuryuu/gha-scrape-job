@@ -2,30 +2,69 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
-	"regexp"
-	"strconv"
 	"time"
 )
 
 const (
-	baseURL  = "https://www.jobstreet.co.id"
-	dataFile = "data/results.jsonl"
+	graphqlURL = "https://id.jobstreet.com/graphql"
+	dataFile   = "data/results.jsonl"
 )
 
-// Keywords to track
 var keywords = []string{
 	"sysadmin",
 	"devops",
 	"cloud",
 	"azure",
 	"infrastructure",
+}
+
+// Query only total count
+const jobSearchQuery = `
+query JobSearchV6($params: JobSearchV6QueryInput!) {
+  jobSearchV6(params: $params) {
+    totalCount
+  }
+}`
+
+type graphqlRequest struct {
+	OperationName string       `json:"operationName"`
+	Variables     gqlVariables `json:"variables"`
+	Query         string       `json:"query"`
+}
+
+type gqlVariables struct {
+	Params gqlParams `json:"params"`
+}
+
+type gqlParams struct {
+	Channel   string `json:"channel"`
+	Keywords  string `json:"keywords"`
+	Locale    string `json:"locale"`
+	Page      int    `json:"page"`
+	PageSize  int    `json:"pageSize"`
+	SiteKey   string `json:"siteKey"`
+	Source    string `json:"source"`
+	SessionID string `json:"eventCaptureSessionId"`
+	UserID    string `json:"eventCaptureUserId"`
+}
+
+type graphqlResponse struct {
+	Data struct {
+		JobSearchV6 struct {
+			TotalCount int `json:"totalCount"`
+		} `json:"jobSearchV6"`
+	} `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
 }
 
 type Result struct {
@@ -39,24 +78,58 @@ type Record struct {
 	Results []Result `json:"results"`
 }
 
-func buildSearchURL(keyword string) string {
-	return fmt.Sprintf("%s/jobs?q=%s&l=indonesia", baseURL, url.QueryEscape(keyword))
+// Generate random UUID v4
+func newUUID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-func fetchCount(keyword string) (int, error) {
-	searchURL := buildSearchURL(keyword)
+func buildJobURL(keyword string) string {
+	return fmt.Sprintf("https://id.jobstreet.com/id/%s-jobs", keyword)
+}
 
-	req, err := http.NewRequest("GET", searchURL, nil)
+func fetchCount(keyword, sessionID string) (int, error) {
+	payload := graphqlRequest{
+		OperationName: "JobSearchV6",
+		Variables: gqlVariables{
+			Params: gqlParams{
+				Channel:   "web",
+				Keywords:  keyword,
+				Locale:    "id-ID",
+				Page:      1,
+				PageSize:  1,
+				SiteKey:   "ID",
+				Source:    "FE_SERP",
+				SessionID: sessionID,
+				UserID:    sessionID,
+			},
+		},
+		Query: jobSearchQuery,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, fmt.Errorf("marshal: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", graphqlURL, bytes.NewReader(body))
 	if err != nil {
 		return 0, fmt.Errorf("build request: %w", err)
 	}
 
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "id-ID,id;q=0.9,en-US;q=0.8")
+	// Set headers to mimic a real browser request
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("seek-request-brand", "jobstreet")
+	req.Header.Set("seek-request-country", "ID")
+	req.Header.Set("x-custom-features", "application/features.seek.all+json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0")
+	req.Header.Set("Origin", "https://id.jobstreet.com")
+	req.Header.Set("Referer", "https://id.jobstreet.com/")
 
 	client := &http.Client{Timeout: 30 * time.Second}
-
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("fetch: %w", err)
@@ -64,147 +137,31 @@ func fetchCount(keyword string) (int, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+		preview, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		return 0, fmt.Errorf("status %d: %s", resp.StatusCode, string(preview))
 	}
 
-	body, err := io.ReadAll(resp.Body)
-
-	log.Printf("  Status: %d | Body preview: %.300s", resp.StatusCode, string(body))
-
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return 0, fmt.Errorf("read body: %w", err)
 	}
 
-	// Parse Next.js JSON script
-	if count, ok := extractFromNextData(body); ok {
-		return count, nil
+	var gqlResp graphqlResponse
+	if err := json.Unmarshal(respBody, &gqlResp); err != nil {
+		return 0, fmt.Errorf("unmarshal: %w", err)
 	}
 
-	// Regex fallback from HTML
-	if count, ok := extractFromHTML(body); ok {
-		return count, nil
+	if len(gqlResp.Errors) > 0 {
+		return 0, fmt.Errorf("graphql error: %s", gqlResp.Errors[0].Message)
 	}
 
-	return 0, fmt.Errorf("job count not found in response")
-}
-
-// Extract count from Next.js
-func extractFromNextData(body []byte) (int, bool) {
-	re := regexp.MustCompile(`<script id="__NEXT_DATA__" type="application/json">([\s\S]*?)</script>`)
-	matches := re.FindSubmatch(body)
-	if len(matches) < 2 {
-		return 0, false
-	}
-
-	var data map[string]interface{}
-	if err := json.Unmarshal(matches[1], &data); err != nil {
-		return 0, false
-	}
-
-	paths := [][]string{
-		{"props", "pageProps", "searchResults", "totalCount"},
-		{"props", "pageProps", "totalCount"},
-		{"props", "pageProps", "jobCount"},
-		{"props", "pageProps", "data", "totalCount"},
-		{"props", "pageProps", "initialData", "totalCount"},
-	}
-	for _, path := range paths {
-		if count, ok := navigatePath(data, path); ok {
-			return count, true
-		}
-	}
-
-	// find field
-	count := recursiveFind(data, []string{"totalCount", "jobCount", "total"})
-	return count, count > 0
-}
-
-func navigatePath(data map[string]interface{}, path []string) (int, bool) {
-	var current interface{} = data
-	for i, key := range path {
-		m, ok := current.(map[string]interface{})
-		if !ok {
-			return 0, false
-		}
-		val, exists := m[key]
-		if !exists {
-			return 0, false
-		}
-		if i == len(path)-1 {
-			return toInt(val)
-		}
-		current = val
-	}
-	return 0, false
-}
-
-// find certain keys recursively
-func recursiveFind(data interface{}, keys []string) int {
-	switch v := data.(type) {
-	case map[string]interface{}:
-		for _, key := range keys {
-			if val, ok := v[key]; ok {
-				if count, ok := toInt(val); ok && count > 0 {
-					return count
-				}
-			}
-		}
-		for _, val := range v {
-			if count := recursiveFind(val, keys); count > 0 {
-				return count
-			}
-		}
-	case []interface{}:
-		for _, item := range v {
-			if count := recursiveFind(item, keys); count > 0 {
-				return count
-			}
-		}
-	}
-	return 0
-}
-
-// extractFromHTML
-func extractFromHTML(body []byte) (int, bool) {
-	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`([\d,\.]+)\s+(?:jobs?|lowongan)`),
-		regexp.MustCompile(`(?:found|ditemukan)[^\d]+([\d,\.]+)`),
-	}
-	stripSep := regexp.MustCompile(`[,\.]`)
-
-	for _, re := range patterns {
-		m := re.FindSubmatch(body)
-		if len(m) >= 2 {
-			cleaned := stripSep.ReplaceAllString(string(m[1]), "")
-			if n, err := strconv.Atoi(cleaned); err == nil && n > 0 {
-				return n, true
-			}
-		}
-	}
-	return 0, false
-}
-
-func toInt(v interface{}) (int, bool) {
-	stripSep := regexp.MustCompile(`[,\.]`)
-	switch val := v.(type) {
-	case float64:
-		return int(val), true
-	case int:
-		return val, true
-	case string:
-		cleaned := stripSep.ReplaceAllString(val, "")
-		if n, err := strconv.Atoi(cleaned); err == nil {
-			return n, true
-		}
-	}
-	return 0, false
+	return gqlResp.Data.JobSearchV6.TotalCount, nil
 }
 
 func appendRecord(record Record) error {
 	if err := os.MkdirAll("data", 0755); err != nil {
 		return err
 	}
-
 	f, err := os.OpenFile(dataFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
@@ -224,33 +181,35 @@ func main() {
 	log.Printf("JobStreet Tracker - %s", time.Now().Format("2006-01-02"))
 	log.Println("==========================================")
 
+	// Generate a new session ID for this run
+	sessionID := newUUID()
+	log.Printf("Session: %s", sessionID)
+
 	record := Record{
 		Date:    time.Now().Format("2006-01-02"),
 		Results: []Result{},
 	}
 
 	for _, keyword := range keywords {
-		searchURL := buildSearchURL(keyword)
-		log.Printf("Scraping: %-15s -> %s", keyword, searchURL)
+		log.Printf("Fetching: %s", keyword)
 
-		count, err := fetchCount(keyword)
+		count, err := fetchCount(keyword, sessionID)
 		if err != nil {
 			log.Printf("  ERROR: %v", err)
 			record.Results = append(record.Results, Result{
 				Keyword: keyword,
 				Count:   -1,
-				URL:     searchURL,
+				URL:     buildJobURL(keyword),
 			})
 		} else {
-			log.Printf("  Found: %d jobs", count)
+			log.Printf("  Count: %d", count)
 			record.Results = append(record.Results, Result{
 				Keyword: keyword,
 				Count:   count,
-				URL:     searchURL,
+				URL:     buildJobURL(keyword),
 			})
 		}
 
-		// Avoid rate limiting with a short delay between requests
 		time.Sleep(3 * time.Second)
 	}
 
@@ -259,5 +218,5 @@ func main() {
 	}
 
 	log.Println("==========================================")
-	log.Println("Done. Data appended to", dataFile)
+	log.Println("Done.")
 }
