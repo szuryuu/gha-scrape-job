@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -26,7 +27,18 @@ var keywords = []string{
 	"infrastructure",
 }
 
-// Query only total count
+type City struct {
+	Name  string
+	Where string
+}
+
+var cities = []City{
+	{Name: "national", Where: ""},
+	{Name: "Jakarta", Where: "DKI Jakarta"},
+	{Name: "Yogyakarta", Where: "DI Yogyakarta"},
+	{Name: "Surabaya", Where: "Surabaya"},
+}
+
 const jobSearchQuery = `
 query JobSearchV6($params: JobSearchV6QueryInput!) {
   jobSearchV6(params: $params) {
@@ -54,6 +66,7 @@ type gqlParams struct {
 	Source    string `json:"source"`
 	SessionID string `json:"eventCaptureSessionId"`
 	UserID    string `json:"eventCaptureUserId"`
+	Where     string `json:"where,omitempty"`
 }
 
 type graphqlResponse struct {
@@ -69,7 +82,8 @@ type graphqlResponse struct {
 
 type Result struct {
 	Keyword string `json:"keyword"`
-	Count   int    `json:"count"`
+	City    string `json:"city"`
+	Count   int    `json:"count"` // -1 if error
 	URL     string `json:"url"`
 }
 
@@ -78,7 +92,6 @@ type Record struct {
 	Results []Result `json:"results"`
 }
 
-// Generate random UUID v4
 func newUUID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
@@ -86,11 +99,16 @@ func newUUID() string {
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-func buildJobURL(keyword string) string {
-	return fmt.Sprintf("https://id.jobstreet.com/id/%s-jobs", keyword)
+func buildJobURL(keyword string, city City) string {
+	base := fmt.Sprintf("https://id.jobstreet.com/id/%s-jobs", keyword)
+	if city.Where == "" {
+		return base
+	}
+	slug := strings.ReplaceAll(city.Where, " ", "-")
+	return fmt.Sprintf("%s/in-%s", base, slug)
 }
 
-func fetchCount(keyword, sessionID string) (int, error) {
+func fetchCount(keyword string, city City, sessionID string) (int, error) {
 	payload := graphqlRequest{
 		OperationName: "JobSearchV6",
 		Variables: gqlVariables{
@@ -104,6 +122,7 @@ func fetchCount(keyword, sessionID string) (int, error) {
 				Source:    "FE_SERP",
 				SessionID: sessionID,
 				UserID:    sessionID,
+				Where:     city.Where,
 			},
 		},
 		Query: jobSearchQuery,
@@ -119,7 +138,6 @@ func fetchCount(keyword, sessionID string) (int, error) {
 		return 0, fmt.Errorf("build request: %w", err)
 	}
 
-	// Set headers to mimic a real browser request
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("seek-request-brand", "jobstreet")
@@ -179,38 +197,44 @@ func main() {
 	log.SetFlags(log.Ltime)
 	log.Println("==========================================")
 	log.Printf("JobStreet Tracker - %s", time.Now().Format("2006-01-02"))
+	log.Printf("Keywords: %d | Cities: %d | Total requests: %d",
+		len(keywords), len(cities), len(keywords)*len(cities))
 	log.Println("==========================================")
 
-	// Generate a new session ID for this run
 	sessionID := newUUID()
-	log.Printf("Session: %s", sessionID)
 
 	record := Record{
 		Date:    time.Now().Format("2006-01-02"),
 		Results: []Result{},
 	}
 
-	for _, keyword := range keywords {
-		log.Printf("Fetching: %s", keyword)
+	for _, city := range cities {
+		log.Printf("── %s ──", city.Name)
 
-		count, err := fetchCount(keyword, sessionID)
-		if err != nil {
-			log.Printf("  ERROR: %v", err)
-			record.Results = append(record.Results, Result{
-				Keyword: keyword,
-				Count:   -1,
-				URL:     buildJobURL(keyword),
-			})
-		} else {
-			log.Printf("  Count: %d", count)
-			record.Results = append(record.Results, Result{
-				Keyword: keyword,
-				Count:   count,
-				URL:     buildJobURL(keyword),
-			})
+		for _, keyword := range keywords {
+			count, err := fetchCount(keyword, city, sessionID)
+			jobURL := buildJobURL(keyword, city)
+
+			if err != nil {
+				log.Printf("  %-15s ERROR: %v", keyword, err)
+				record.Results = append(record.Results, Result{
+					Keyword: keyword,
+					City:    city.Name,
+					Count:   -1,
+					URL:     jobURL,
+				})
+			} else {
+				log.Printf("  %-15s %d", keyword, count)
+				record.Results = append(record.Results, Result{
+					Keyword: keyword,
+					City:    city.Name,
+					Count:   count,
+					URL:     jobURL,
+				})
+			}
+
+			time.Sleep(2 * time.Second)
 		}
-
-		time.Sleep(3 * time.Second)
 	}
 
 	if err := appendRecord(record); err != nil {
